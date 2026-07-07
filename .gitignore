@@ -1,0 +1,12 @@
+# Local Docker image export (large)
+llm-scaler-vllm.tar
+*.tar
+
+# Secrets
+.env
+.env.*
+HF_TOKEN
+
+# Logs and editor
+*.log
+.DS_Store

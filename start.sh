@@ -1,0 +1,214 @@
+#!/bin/bash
+# vLLM (Intel XPU) — serve a HuggingFace Qwen3 model with docker.io/intel/llm-scaler-vllm.
+# Default is a small GGUF quant, downloaded from HuggingFace ONCE into a persistent cache.
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:latest}"
+CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm}"
+HOST_PORT="${VLLM_PORT:-8000}"
+
+# HuggingFace source (full safetensors by default). Override, e.g. FP8 or a smaller model:
+#   HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh
+# Set HF_GGUF_FILE to a *.gguf name to fetch/serve a single GGUF file instead.
+# Default: Qwen3.5-35B-A3B + online sym_int4 on one Arc (see README).
+HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3.5-35B-A3B}"
+HF_GGUF_FILE="${HF_GGUF_FILE-}"
+HF_MODEL_CACHE_ROOT="${HF_MODEL_CACHE_ROOT:-/home/aibox/models/huggingface}"
+
+MODEL_DIR_BASENAME="$(basename "$HF_MODEL_ID")"
+CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
+
+# vLLM tuning — env vars set before ./start.sh win; otherwise profile by model id.
+VLLM_CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
+VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
+VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT="${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:-1}"
+
+_large_moe=0
+[[ "$MODEL_DIR_BASENAME" == *35B* || "$MODEL_DIR_BASENAME" == *122B* || "$MODEL_DIR_BASENAME" == *30B*A3B* ]] && _large_moe=1
+_prequant_fp8=0
+[[ "$MODEL_DIR_BASENAME" == *[Ff][Pp]8* ]] && _prequant_fp8=1
+_small_dense=0
+[[ "$MODEL_DIR_BASENAME" == *8B* || "$MODEL_DIR_BASENAME" == *7B* || "$MODEL_DIR_BASENAME" == *1.5B* ]] && [ "$_large_moe" = 0 ] && _small_dense=1
+
+if [ "$_prequant_fp8" = 1 ]; then
+  if [ "${VLLM_ALLOW_PREQUANT_FP8:-0}" != 1 ]; then
+    echo "ERROR: Hugging Face pre-quantized FP8 checkpoints (*-FP8) are not supported for"
+    echo "       Qwen3.5 MoE on Intel XPU vLLM (MoE expects online FP8, not serialized FP8)."
+    echo "       Use instead:"
+    echo "         • Two GPUs: HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B VLLM_QUANTIZATION=fp8 VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1"
+    echo "         • One GPU:  VLLM_QUANTIZATION=sym_int4 (see README)"
+    echo "         • Smaller:  HF_MODEL_ID=Qwen/Qwen3-8B VLLM_QUANTIZATION="
+    echo "       To force an attempt anyway: VLLM_ALLOW_PREQUANT_FP8=1 ./start.sh"
+    exit 1
+  fi
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
+  if [ -z "${VLLM_QUANTIZATION+x}" ]; then VLLM_QUANTIZATION=""; else VLLM_QUANTIZATION="${VLLM_QUANTIZATION}"; fi
+  VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-0}"
+elif [ "$_large_moe" = 1 ]; then
+  # Default for one ~32 GiB GPU: online sym_int4 (online FP8 from BF16 often OOMs).
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-2048}"
+  VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-sym_int4}"
+  VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-0}"
+elif [ "$_small_dense" = 1 ]; then
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
+  if [ -z "${VLLM_QUANTIZATION+x}" ]; then VLLM_QUANTIZATION=""; else VLLM_QUANTIZATION="${VLLM_QUANTIZATION}"; fi
+  VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-1}"
+else
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
+  VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-fp8}"
+  VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-1}"
+fi
+
+if [ -n "$HF_GGUF_FILE" ]; then
+  MODEL_IN_CONTAINER="/models/$MODEL_DIR_BASENAME/$HF_GGUF_FILE"
+  TARGET_ON_HOST="$CACHE_DIR/$HF_GGUF_FILE"
+else
+  MODEL_IN_CONTAINER="/models/$MODEL_DIR_BASENAME"
+  TARGET_ON_HOST="$CACHE_DIR/config.json"
+fi
+
+echo "==> Load vLLM image from local tarball (if present)"
+if [ -f "$DIR/llm-scaler-vllm.tar" ]; then
+  docker load -i "$DIR/llm-scaler-vllm.tar"
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "ERROR: Container image not found locally: $IMAGE"
+  echo "Place llm-scaler-vllm.tar in $DIR and run again, or: docker load -i <your-export.tar>"
+  exit 1
+fi
+
+# "Downloaded once" guard: skip when the cache already has the target artifact.
+model_cached() {
+  [ -f "$CACHE_DIR/.download-complete" ] && return 0
+  if [ -n "$HF_GGUF_FILE" ]; then
+    [ -f "$TARGET_ON_HOST" ] && return 0
+    return 1
+  fi
+  [ -f "$CACHE_DIR/config.json" ] || return 1
+  compgen -G "$CACHE_DIR/*.safetensors" >/dev/null && return 0
+  [ -f "$CACHE_DIR/model.safetensors.index.json" ] && return 0
+  [ -f "$CACHE_DIR/pytorch_model.bin.index.json" ] && return 0
+  return 1
+}
+
+echo "==> HuggingFace model cache: $CACHE_DIR"
+[ -n "$HF_GGUF_FILE" ] && echo "    GGUF file: $HF_GGUF_FILE"
+mkdir -p "$HF_MODEL_CACHE_ROOT"
+if model_cached; then
+  echo "    Cache present, skipping download."
+else
+  echo "    Not cached yet. Downloading from HuggingFace (first run only)..."
+  docker run --rm --pull=never \
+    -v "$HF_MODEL_CACHE_ROOT:/models" \
+    -e HF_TOKEN \
+    -e HUGGING_FACE_HUB_TOKEN="${HF_TOKEN:-}" \
+    --entrypoint hf \
+    "$IMAGE" download "$HF_MODEL_ID" ${HF_GGUF_FILE:+"$HF_GGUF_FILE"} \
+      --local-dir "/models/$MODEL_DIR_BASENAME"
+  touch "$CACHE_DIR/.download-complete"
+  echo "    Download complete."
+fi
+
+echo "==> Start container ($IMAGE) with $MODEL_IN_CONTAINER"
+echo "    Memory: XPU util ${VLLM_GPU_MEMORY_UTILIZATION}, quant=${VLLM_QUANTIZATION:-none}, tp=${VLLM_TENSOR_PARALLEL_SIZE}, max_len=${VLLM_MAX_MODEL_LEN}"
+[ "${VLLM_CPU_OFFLOAD_GB}" != "0" ] && echo "    WARNING: --cpu-offload-gb is experimental on XPU MoE; prefer FP8 + VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT"
+if [ "$_large_moe" = 1 ] && [ "$_prequant_fp8" = 0 ] && [ "$VLLM_TENSOR_PARALLEL_SIZE" = 1 ] && [ "${VLLM_QUANTIZATION}" = "fp8" ]; then
+  echo "    NOTE: Online FP8 on one ~32 GiB GPU may OOM; default is sym_int4, or use VLLM_TENSOR_PARALLEL_SIZE=2"
+fi
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+QUANT_ARGS=()
+if [ -n "$VLLM_QUANTIZATION" ]; then
+  QUANT_ARGS=(--quantization "$VLLM_QUANTIZATION")
+fi
+EAGER_ARGS=()
+if [ "${VLLM_ENFORCE_EAGER}" != "0" ]; then
+  EAGER_ARGS=(--enforce-eager)
+fi
+CPU_OFFLOAD_ARGS=()
+if [ "${VLLM_CPU_OFFLOAD_GB}" != "0" ]; then
+  CPU_OFFLOAD_ARGS=(--cpu-offload-gb "$VLLM_CPU_OFFLOAD_GB")
+fi
+OFFLOAD_QUANT_ENV=()
+if [ -n "$VLLM_QUANTIZATION" ]; then
+  OFFLOAD_QUANT_ENV=(-e "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT}")
+fi
+ZE_ENV=()
+if [ -n "${ZE_AFFINITY_MASK:-}" ]; then
+  ZE_ENV=(-e "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}")
+fi
+PREFIX_CACHE_ARGS=()
+if [ "${VLLM_PREFIX_CACHING:-1}" = "0" ]; then
+  PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
+fi
+INT4_ENV=()
+if [ "${VLLM_QUANTIZATION:-}" = "sym_int4" ]; then
+  INT4_ENV=(-e "VLLM_QUANTIZE_Q40_LIB=${VLLM_QUANTIZE_Q40_LIB:-/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so}")
+fi
+
+GROUP_OPTS=(--group-add keep-groups)
+if ! docker info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
+  GROUP_OPTS=(--group-add "$(stat -c '%g' /dev/dri/renderD128)" --group-add "$(stat -c '%g' /dev/dri/card0)")
+fi
+
+# Shared memory for vLLM workers. --ipc=host and --shm-size are mutually exclusive
+# (Podman rejects setting shm-size in the host IPC namespace), so pick one.
+if [ "${VLLM_IPC:-host}" = "host" ]; then
+  SHM_OPTS=(--ipc=host)
+else
+  SHM_OPTS=(--shm-size="${VLLM_SHM_SIZE:-16g}")
+fi
+
+# Weights are local now; keep the serve container off the network for models.
+docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
+  --pull=never \
+  --user 0:0 \
+  "${GROUP_OPTS[@]}" \
+  --device /dev/dri \
+  -v /dev/dri/by-path:/dev/dri/by-path \
+  "${SHM_OPTS[@]}" \
+  -e VLLM_TARGET_DEVICE=xpu \
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
+  -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
+  "${OFFLOAD_QUANT_ENV[@]}" \
+  "${ZE_ENV[@]}" \
+  "${INT4_ENV[@]}" \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
+  -p "${HOST_PORT}:8000" \
+  -v "$HF_MODEL_CACHE_ROOT:/models:ro" \
+  --entrypoint vllm \
+  "$IMAGE" \
+  serve "$MODEL_IN_CONTAINER" \
+  --served-model-name "$MODEL_DIR_BASENAME" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype "${VLLM_DTYPE:-float16}" \
+  --max-model-len "$VLLM_MAX_MODEL_LEN" \
+  --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS" \
+  --block-size "$VLLM_BLOCK_SIZE" \
+  --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
+  --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE" \
+  "${QUANT_ARGS[@]}" \
+  "${EAGER_ARGS[@]}" \
+  "${CPU_OFFLOAD_ARGS[@]}" \
+  "${PREFIX_CACHE_ARGS[@]}" \
+  --trust-remote-code \
+  ${VLLM_EXTRA_ARGS:-}
+
+echo ""
+echo "Done. $CONTAINER_NAME is starting (OpenAI API on port $HOST_PORT)."
+echo "Logs: docker logs -f $CONTAINER_NAME"
+echo "Test:  no_proxy=127.0.0.1 curl -s http://127.0.0.1:${HOST_PORT}/v1/models"
+
