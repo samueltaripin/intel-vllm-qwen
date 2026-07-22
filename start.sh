@@ -11,12 +11,12 @@ HOST_PORT="${VLLM_PORT:-8000}"
 # HuggingFace source (full safetensors by default). Override, e.g. FP8 or a smaller model:
 #   HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh
 # Set HF_GGUF_FILE to a *.gguf name to fetch/serve a single GGUF file instead.
-# Default: Qwen3-8B (fp16) so a single Arc can serve the >=64k context Hermes Agent
+# Default: Qwen3-0.6B (fp16) so a single Arc can serve the >=64k context Hermes Agent
 # requires. For max quality on non-agent use, run the 35B MoE explicitly:
 #   HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B ./start.sh   (online sym_int4, ~8k ctx; see README)
-HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3-8B}"
+HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3-0.6B}"
 HF_GGUF_FILE="${HF_GGUF_FILE-}"
-HF_MODEL_CACHE_ROOT="${HF_MODEL_CACHE_ROOT:-/home/aibox/models/huggingface}"
+HF_MODEL_CACHE_ROOT="${HF_MODEL_CACHE_ROOT:-$HOME/models/huggingface}"
 
 MODEL_DIR_BASENAME="$(basename "$HF_MODEL_ID")"
 CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
@@ -33,7 +33,7 @@ _large_moe=0
 _prequant_fp8=0
 [[ "$MODEL_DIR_BASENAME" == *[Ff][Pp]8* ]] && _prequant_fp8=1
 _small_dense=0
-[[ "$MODEL_DIR_BASENAME" == *8B* || "$MODEL_DIR_BASENAME" == *7B* || "$MODEL_DIR_BASENAME" == *1.5B* ]] && [ "$_large_moe" = 0 ] && _small_dense=1
+[[ "$MODEL_DIR_BASENAME" == *8B* || "$MODEL_DIR_BASENAME" == *7B* || "$MODEL_DIR_BASENAME" == *2B* || "$MODEL_DIR_BASENAME" == *0.6B* ]] && [ "$_large_moe" = 0 ] && _small_dense=1
 
 if [ "$_prequant_fp8" = 1 ]; then
   if [ "${VLLM_ALLOW_PREQUANT_FP8:-0}" != 1 ]; then
@@ -82,6 +82,19 @@ else
   VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-1}"
 fi
 
+# Optional low-memory profile for iGPU or small VRAM devices.
+# Enable with VLLM_LOW_MEM_PROFILE=1 ./start.sh
+if [ "${VLLM_LOW_MEM_PROFILE:-0}" = "1" ]; then
+  VLLM_MAX_MODEL_LEN="${VLLM_LOW_MEM_MAX_MODEL_LEN:-131072}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_LOW_MEM_GPU_MEMORY_UTILIZATION:-0.85}"
+  VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_LOW_MEM_MAX_NUM_BATCHED_TOKENS:-1024}"
+  if [ -z "${VLLM_QUANTIZATION}" ]; then
+    VLLM_QUANTIZATION="${VLLM_LOW_MEM_QUANTIZATION:-fp8}"
+  fi
+  VLLM_PREFIX_CACHING=0
+  VLLM_ROPE_SCALING=""
+fi
+
 if [ -n "$HF_GGUF_FILE" ]; then
   MODEL_IN_CONTAINER="/models/$MODEL_DIR_BASENAME/$HF_GGUF_FILE"
   TARGET_ON_HOST="$CACHE_DIR/$HF_GGUF_FILE"
@@ -101,22 +114,79 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 
 # "Downloaded once" guard: skip when the cache already has the target artifact.
+index_complete() {
+  python3 - "$CACHE_DIR" "$1" <<'PY'
+import json
+import os
+import sys
+
+cache_dir = sys.argv[1]
+index_file = sys.argv[2]
+
+with open(index_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+files = sorted(set((data.get("weight_map") or {}).values()))
+if not files:
+    sys.exit(1)
+
+missing = [name for name in files if not os.path.isfile(os.path.join(cache_dir, name))]
+if missing:
+    print("\n".join(missing))
+    sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
 model_cached() {
-  [ -f "$CACHE_DIR/.download-complete" ] && return 0
   if [ -n "$HF_GGUF_FILE" ]; then
     [ -f "$TARGET_ON_HOST" ] && return 0
     return 1
   fi
   [ -f "$CACHE_DIR/config.json" ] || return 1
+
+  if [ -f "$CACHE_DIR/model.safetensors.index.json" ]; then
+    index_complete "$CACHE_DIR/model.safetensors.index.json" >/tmp/vllm-missing-shards.$$ 2>/dev/null && return 0
+    echo "    Incomplete safetensors cache; missing shard files:"
+    sed 's/^/      - /' /tmp/vllm-missing-shards.$$ || true
+    rm -f /tmp/vllm-missing-shards.$$ || true
+    return 1
+  fi
+
   compgen -G "$CACHE_DIR/*.safetensors" >/dev/null && return 0
-  [ -f "$CACHE_DIR/model.safetensors.index.json" ] && return 0
-  [ -f "$CACHE_DIR/pytorch_model.bin.index.json" ] && return 0
+
+  if [ -f "$CACHE_DIR/pytorch_model.bin.index.json" ]; then
+    index_complete "$CACHE_DIR/pytorch_model.bin.index.json" >/tmp/vllm-missing-shards.$$ 2>/dev/null && return 0
+    echo "    Incomplete pytorch bin cache; missing shard files:"
+    sed 's/^/      - /' /tmp/vllm-missing-shards.$$ || true
+    rm -f /tmp/vllm-missing-shards.$$ || true
+    return 1
+  fi
+
   return 1
 }
 
 echo "==> HuggingFace model cache: $CACHE_DIR"
 [ -n "$HF_GGUF_FILE" ] && echo "    GGUF file: $HF_GGUF_FILE"
 mkdir -p "$HF_MODEL_CACHE_ROOT"
+
+# Download needs write access to cache root and model directory.
+if [ ! -w "$HF_MODEL_CACHE_ROOT" ]; then
+  echo "ERROR: Cache root is not writable: $HF_MODEL_CACHE_ROOT"
+  echo "Hint: set a writable path, for example:"
+  echo "  HF_MODEL_CACHE_ROOT=$HOME/models/huggingface ./start.sh"
+  exit 1
+fi
+if [ -e "$CACHE_DIR" ] && [ ! -w "$CACHE_DIR" ]; then
+  echo "ERROR: Model cache dir is not writable: $CACHE_DIR"
+  echo "This usually happens when an earlier run created root-owned files."
+  echo "Fix options:"
+  echo "  1) Use a new writable cache root:"
+  echo "     HF_MODEL_CACHE_ROOT=$HOME/models/huggingface ./start.sh"
+  echo "  2) Or repair ownership on the old cache path, then retry."
+  exit 1
+fi
 if model_cached; then
   echo "    Cache present, skipping download."
 else
@@ -134,6 +204,7 @@ fi
 
 echo "==> Start container ($IMAGE) with $MODEL_IN_CONTAINER"
 echo "    Memory: XPU util ${VLLM_GPU_MEMORY_UTILIZATION}, quant=${VLLM_QUANTIZATION:-none}, tp=${VLLM_TENSOR_PARALLEL_SIZE}, max_len=${VLLM_MAX_MODEL_LEN}"
+[ "${VLLM_LOW_MEM_PROFILE:-0}" = "1" ] && echo "    Low-memory profile enabled for iGPU/small VRAM devices."
 [ "${VLLM_CPU_OFFLOAD_GB}" != "0" ] && echo "    WARNING: --cpu-offload-gb is experimental on XPU MoE; prefer FP8 + VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT"
 if [ "$_large_moe" = 1 ] && [ "$_prequant_fp8" = 0 ] && [ "$VLLM_TENSOR_PARALLEL_SIZE" = 1 ] && [ "${VLLM_QUANTIZATION}" = "fp8" ]; then
   echo "    NOTE: Online FP8 on one ~32 GiB GPU may OOM; default is sym_int4, or use VLLM_TENSOR_PARALLEL_SIZE=2"
