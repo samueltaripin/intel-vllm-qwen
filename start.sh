@@ -4,15 +4,17 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:latest}"
+IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:0.14.0-b8.3.2}"
 CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm}"
 HOST_PORT="${VLLM_PORT:-8000}"
 
 # HuggingFace source (full safetensors by default). Override, e.g. FP8 or a smaller model:
 #   HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh
 # Set HF_GGUF_FILE to a *.gguf name to fetch/serve a single GGUF file instead.
-# Default: Qwen3.5-35B-A3B + online sym_int4 on one Arc (see README).
-HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3.5-35B-A3B}"
+# Default: Qwen3-8B (fp16) so a single Arc can serve the >=64k context Hermes Agent
+# requires. For max quality on non-agent use, run the 35B MoE explicitly:
+#   HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B ./start.sh   (online sym_int4, ~8k ctx; see README)
+HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3-8B}"
 HF_GGUF_FILE="${HF_GGUF_FILE-}"
 HF_MODEL_CACHE_ROOT="${HF_MODEL_CACHE_ROOT:-/home/aibox/models/huggingface}"
 
@@ -51,17 +53,27 @@ if [ "$_prequant_fp8" = 1 ]; then
   VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-0}"
 elif [ "$_large_moe" = 1 ]; then
   # Default for one ~32 GiB GPU: online sym_int4 (online FP8 from BF16 often OOMs).
-  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+  # 8192 context suits agent workloads (e.g. Hermes); lower to 4096 if you hit XPU OOM.
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
   VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
   VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-2048}"
   VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-sym_int4}"
   VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-0}"
 elif [ "$_small_dense" = 1 ]; then
-  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
-  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  # 64k context to satisfy Hermes Agent's hard minimum (rejected at startup below 64k).
+  # Qwen3-8B native window is 40960, so we extend to 65536 via YaRN (see VLLM_ROPE_SCALING).
+  # fp16 weights (~16 GiB) + 64k KV cache fit one ~32 GiB Arc at util 0.95; set
+  # VLLM_QUANTIZATION=fp8 if you hit XPU OOM at the end of load.
+  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
+  VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
   VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
   if [ -z "${VLLM_QUANTIZATION+x}" ]; then VLLM_QUANTIZATION=""; else VLLM_QUANTIZATION="${VLLM_QUANTIZATION}"; fi
   VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-1}"
+  # YaRN scaling for Qwen3 dense (original 40960 -> ~65536 at factor 1.6). Set
+  # VLLM_ROPE_SCALING= (empty) to disable, or override the JSON for a different model/window.
+  if [ -z "${VLLM_ROPE_SCALING+x}" ]; then
+    VLLM_ROPE_SCALING='{"rope_type":"yarn","factor":1.6,"original_max_position_embeddings":40960}'
+  fi
 else
   VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
   VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
@@ -157,6 +169,21 @@ if [ "${VLLM_QUANTIZATION:-}" = "sym_int4" ]; then
   INT4_ENV=(-e "VLLM_QUANTIZE_Q40_LIB=${VLLM_QUANTIZE_Q40_LIB:-/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so}")
 fi
 
+# RoPE scaling (e.g. YaRN) to serve a context window beyond the model's native size.
+# This vLLM build has no --rope-scaling flag; rope_scaling is injected via --hf-overrides.
+ROPE_ARGS=()
+if [ -n "${VLLM_ROPE_SCALING:-}" ]; then
+  ROPE_ARGS=(--hf-overrides "{\"rope_scaling\": ${VLLM_ROPE_SCALING}}")
+fi
+
+# Tool/function calling. Required for agents like Hermes; without these the model
+# emits tool calls as plain text. Set VLLM_ENABLE_AUTO_TOOL_CHOICE=0 to disable.
+TOOL_ARGS=()
+if [ "${VLLM_ENABLE_AUTO_TOOL_CHOICE:-1}" != "0" ]; then
+  TOOL_ARGS+=(--enable-auto-tool-choice)
+  TOOL_ARGS+=(--tool-call-parser "${VLLM_TOOL_CALL_PARSER:-hermes}")
+fi
+
 GROUP_OPTS=(--group-add keep-groups)
 if ! docker info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
   GROUP_OPTS=(--group-add "$(stat -c '%g' /dev/dri/renderD128)" --group-add "$(stat -c '%g' /dev/dri/card0)")
@@ -204,6 +231,8 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${EAGER_ARGS[@]}" \
   "${CPU_OFFLOAD_ARGS[@]}" \
   "${PREFIX_CACHE_ARGS[@]}" \
+  "${ROPE_ARGS[@]}" \
+  "${TOOL_ARGS[@]}" \
   --trust-remote-code \
   ${VLLM_EXTRA_ARGS:-}
 
