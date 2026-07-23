@@ -188,7 +188,7 @@ If you still see **XPU OOM** at end of load, try **`VLLM_TENSOR_PARALLEL_SIZE=2`
 
 ### Qwen3.5-35B-A3B (MoE, two Arc GPUs)
 
-Intel’s reference uses **tensor parallel = 2** across two cards.
+Intel’s reference uses **tensor parallel = 2** across two cards. With two identical GPUs installed, `start.sh` **auto-detects** them and defaults `VLLM_TENSOR_PARALLEL_SIZE` to `2` — the block below just makes it explicit and pins device order with `ZE_AFFINITY_MASK`.
 
 ```bash
 HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B \
@@ -262,7 +262,7 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 | `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT` | `1` | Use host RAM during FP8/INT4 load (only if quant enabled) |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of XPU memory for weights + KV cache |
 | `VLLM_CPU_OFFLOAD_GB` | `0` | vLLM `--cpu-offload-gb`; **not recommended** for Qwen3.5 MoE on XPU |
-| `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of XPUs (`--tensor-parallel-size`) |
+| `VLLM_TENSOR_PARALLEL_SIZE` | auto (count of `/dev/dri/renderD*`) | Number of XPUs (`--tensor-parallel-size`). Auto-detected from render nodes; set explicitly to override (e.g. to exclude an iGPU or force `1`) |
 | `ZE_AFFINITY_MASK` | *(unset)* | e.g. `0,1` for two GPUs |
 
 ### vLLM serve tuning
