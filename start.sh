@@ -4,7 +4,7 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:0.14.0-b8.3.2}"
+IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:latest}"
 CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm}"
 HOST_PORT="${VLLM_PORT:-8000}"
 
@@ -14,8 +14,8 @@ HOST_PORT="${VLLM_PORT:-8000}"
 # Default: Qwen3-0.6B (fp16) so a single Arc can serve the >=64k context Hermes Agent
 # requires. For max quality on non-agent use, run the 35B MoE explicitly:
 #   HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B ./start.sh   (online sym_int4, ~8k ctx; see README)
-HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3-0.6B}"
-HF_GGUF_FILE="${HF_GGUF_FILE-}"
+HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen3.6-35B-A3B}"
+HF_GGUF_FILE="${HF_GGUF_FILE:-}"
 HF_MODEL_CACHE_ROOT="${HF_MODEL_CACHE_ROOT:-$HOME/models/huggingface}"
 
 MODEL_DIR_BASENAME="$(basename "$HF_MODEL_ID")"
@@ -27,6 +27,7 @@ VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
 VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT="${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:-1}"
+VLLM_LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH:-/opt/intel/oneapi/ccl/latest/lib:/opt/intel/oneapi/2025.3/lib}"
 
 _large_moe=0
 [[ "$MODEL_DIR_BASENAME" == *35B* || "$MODEL_DIR_BASENAME" == *122B* || "$MODEL_DIR_BASENAME" == *30B*A3B* ]] && _large_moe=1
@@ -235,9 +236,10 @@ PREFIX_CACHE_ARGS=()
 if [ "${VLLM_PREFIX_CACHING:-1}" = "0" ]; then
   PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
 fi
+# INT4 lib path optional; omit if not present in container image
 INT4_ENV=()
-if [ "${VLLM_QUANTIZATION:-}" = "sym_int4" ]; then
-  INT4_ENV=(-e "VLLM_QUANTIZE_Q40_LIB=${VLLM_QUANTIZE_Q40_LIB:-/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so}")
+if [ "${VLLM_QUANTIZATION:-}" = "sym_int4" ] && [ -n "${VLLM_QUANTIZE_Q40_LIB:-}" ]; then
+  INT4_ENV=(-e "VLLM_QUANTIZE_Q40_LIB=${VLLM_QUANTIZE_Q40_LIB}")
 fi
 
 # RoPE scaling (e.g. YaRN) to serve a context window beyond the model's native size.
@@ -277,6 +279,7 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   -v /dev/dri/by-path:/dev/dri/by-path \
   "${SHM_OPTS[@]}" \
   -e VLLM_TARGET_DEVICE=xpu \
+  -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
   -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
   "${OFFLOAD_QUANT_ENV[@]}" \
