@@ -271,6 +271,9 @@ else
 fi
 
 # Weights are local now; keep the serve container off the network for models.
+  # -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
+echo "==> Running docker command (expanded):"
+set -x
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   --pull=never \
   --user 0:0 \
@@ -279,7 +282,6 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   -v /dev/dri/by-path:/dev/dri/by-path \
   "${SHM_OPTS[@]}" \
   -e VLLM_TARGET_DEVICE=xpu \
-  -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
   -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
   "${OFFLOAD_QUANT_ENV[@]}" \
@@ -309,6 +311,7 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${TOOL_ARGS[@]}" \
   --trust-remote-code \
   ${VLLM_EXTRA_ARGS:-}
+set +x
 
 echo ""
 echo "Done. $CONTAINER_NAME is starting (OpenAI API on port $HOST_PORT)."
