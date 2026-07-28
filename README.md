@@ -289,7 +289,7 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 
 `VLLM_TARGET_DEVICE=xpu` is always set by the script.
 
-`start.sh` picks defaults from the model id: **small dense** (8B/7B/1.5B → the default `Qwen3-8B`) gets fp16 + 64k YaRN, **large MoE** (35B/30B-A3B/122B) gets `sym_int4` at ~8k, and `*-FP8` ids are blocked (see above). Export a variable before `./start.sh` to override any of it.
+`start.sh` picks defaults from the model id: **small dense** (8B/7B/0.6B → the default `Qwen3-0.6B`) gets fp16 + 64k YaRN, **large MoE** (35B/30B-A3B/122B) gets `sym_int4` at ~8k, and `*-FP8` ids are blocked (see above). Export a variable before `./start.sh` to override any of it.
 
 ---
 
